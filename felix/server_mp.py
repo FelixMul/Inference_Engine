@@ -294,6 +294,8 @@ def main():
     parser.add_argument("--num-gpus", type=int, default=8)
     parser.add_argument("--gpu-offset", type=int, default=0,
                         help="Start from this GPU index (skip busy GPUs)")
+    parser.add_argument("--no-compile", action="store_true",
+                        help="Disable torch.compile (faster startup, slower inference)")
     args = parser.parse_args()
     num_gpus = args.num_gpus
 
@@ -312,7 +314,7 @@ def main():
         rq = Queue()
         request_queues.append(rq)
         physical_gpu = gpu_offset + i
-        w = start_worker(i, args.model_path, rq, result_queue, physical_gpu=physical_gpu)
+        w = start_worker(i, args.model_path, rq, result_queue, physical_gpu=physical_gpu, compile_model=not args.no_compile)
         workers.append(w)
 
     # Wait for all workers to be ready

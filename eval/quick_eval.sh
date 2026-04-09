@@ -30,7 +30,7 @@ echo "--- Step 2/2: Throughput (c=1,2,4,8,16,32,64, 64 reqs each) ---"
 $PYTHON -m eval.throughput.run_throughput \
     --base-url "${BASE_URL}" \
     --num-requests 64 \
-    --concurrency 4 16 64 \
+    --concurrency 64 32 16 8 4 2 1 \
     --output results/quick_throughput.json \
     --baseline baseline/results/throughput_baseline.json
 echo ""

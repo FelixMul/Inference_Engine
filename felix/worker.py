@@ -47,12 +47,12 @@ class WorkResult:
     hit_eos: bool
 
 
-def worker_loop(gpu_id: int, model_path: str, request_queue: Queue, result_queue: Queue, physical_gpu: int = None):
+def worker_loop(gpu_id: int, model_path: str, request_queue: Queue, result_queue: Queue, physical_gpu: int = None, compile_model: bool = False):
     """Main loop for a GPU worker process."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(physical_gpu if physical_gpu is not None else gpu_id)
 
     # Load model on this GPU (visible as cuda:0 due to CUDA_VISIBLE_DEVICES)
-    engine = InferenceEngine(model_path, num_gpus=1, compile_model=False)
+    engine = InferenceEngine(model_path, num_gpus=1, compile_model=compile_model)
     engine.load()
 
     result_queue.put(("ready", gpu_id))
@@ -98,8 +98,8 @@ def worker_loop(gpu_id: int, model_path: str, request_queue: Queue, result_queue
             ))
 
 
-def start_worker(gpu_id: int, model_path: str, request_queue: Queue, result_queue: Queue, physical_gpu: int = None) -> Process:
+def start_worker(gpu_id: int, model_path: str, request_queue: Queue, result_queue: Queue, physical_gpu: int = None, compile_model: bool = False) -> Process:
     """Spawn a worker process for the given GPU."""
-    p = Process(target=worker_loop, args=(gpu_id, model_path, request_queue, result_queue, physical_gpu), daemon=True)
+    p = Process(target=worker_loop, args=(gpu_id, model_path, request_queue, result_queue, physical_gpu, compile_model), daemon=True)
     p.start()
     return p

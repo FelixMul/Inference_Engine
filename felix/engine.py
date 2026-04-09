@@ -46,7 +46,7 @@ class GenerationResult:
 class InferenceEngine:
     """Manages multiple model replicas across GPUs."""
 
-    def __init__(self, model_path: str, num_gpus: int = 8, compile_model: bool = False):
+    def __init__(self, model_path: str, num_gpus: int = 8, compile_model: bool = True):
         self.model_path = model_path
         self.num_gpus = min(num_gpus, torch.cuda.device_count())
         self.models: list = []
@@ -96,7 +96,11 @@ class InferenceEngine:
             if self.compile_model:
                 try:
                     print("compiling...", end=" ", flush=True)
-                    m.model = torch.compile(m.model, mode="default")
+                    m.model.forward = torch.compile(
+                        m.model.forward,
+                        mode="default",
+                        fullgraph=False,
+                    )
                 except Exception as e:
                     print(f"compile failed ({e}), using eager", end=" ", flush=True)
 
