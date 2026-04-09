@@ -5,7 +5,9 @@ import uuid
 import torch
 from fastapi import FastAPI
 from pydantic import BaseModel
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoTokenizer
+
+from server.model.loader import load_model
 
 MODEL_PATH = "/mnt/data/GPUINFERENCE/Qwen3.5-35B-A3B"
 
@@ -20,14 +22,7 @@ async def startup():
     global tokenizer, model
     print("Loading tokenizer...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-    print("Loading model...")
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
-    model.eval()
-    print("Model ready.")
+    model = load_model(MODEL_PATH, device="cuda")
 
 
 @app.get("/health")
@@ -58,25 +53,20 @@ async def chat_completions(request: ChatRequest):
         add_generation_prompt=True,
         enable_thinking=False,
     )
-    input_ids = tokenizer(text, return_tensors="pt").input_ids.to(model.device)
+    input_ids = tokenizer(text, return_tensors="pt").input_ids.cuda()
     prompt_tokens = input_ids.shape[1]
 
-    do_sample = request.temperature > 0.0
-
     async with lock:
-        with torch.no_grad():
-            output_ids = model.generate(
-                input_ids,
-                max_new_tokens=request.max_tokens,
-                do_sample=do_sample,
-                temperature=request.temperature if do_sample else None,
-                top_p=request.top_p if do_sample else None,
-            )
+        generated_ids = model.generate(
+            input_ids,
+            max_new_tokens=request.max_tokens,
+            temperature=request.temperature,
+            top_p=request.top_p,
+        )
 
-    generated = output_ids[0][prompt_tokens:]
-    finish_reason = "length" if len(generated) == request.max_tokens else "stop"
-    content = tokenizer.decode(generated, skip_special_tokens=True)
-    completion_tokens = len(generated)
+    finish_reason = "length" if generated_ids.shape[1] == request.max_tokens else "stop"
+    content = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+    completion_tokens = generated_ids.shape[1]
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
