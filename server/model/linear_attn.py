@@ -83,9 +83,12 @@ class GatedDeltaNet(nn.Module):
         q = q.repeat_interleave(_EXPAND, dim=2)   # [B, T, 32, 128]
         kk = kk.repeat_interleave(_EXPAND, dim=2)  # [B, T, 32, 128]
 
-        # L2-normalize Q and K (use_qk_l2norm_in_kernel=True)
+        # L2-normalize Q and K (use_qk_l2norm_in_kernel=True), then scale Q by 1/sqrt(d_k).
+        # HF's torch_recurrent_gated_delta_rule does `query = query * (1 / sqrt(k_head_dim))`
+        # before the recurrence; without it our output norm is sqrt(128)x too large.
         q = F.normalize(q.float(), dim=-1).to(x.dtype)
         kk = F.normalize(kk.float(), dim=-1).to(x.dtype)
+        q = q * (_HEAD_DIM ** -0.5)
 
         # Beta and decay (computed in float32 for precision)
         beta = torch.sigmoid(b_raw.float()).to(x.dtype)   # [B, T, 32]

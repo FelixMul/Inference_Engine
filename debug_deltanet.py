@@ -154,6 +154,7 @@ with torch.no_grad():
     # Sequential delta rule (decay first, then delta from decayed state)
     q_n  = F.normalize(q.float(), dim=-1).to(h.dtype)
     kk_n = F.normalize(kk.float(), dim=-1).to(h.dtype)
+    q_n  = q_n * (_HEAD_DIM ** -0.5)   # HF scales query by 1/sqrt(d_k) inside the kernel
     state = h.new_zeros(B, _EXP_HEADS, _HEAD_DIM, _HEAD_DIM)
     outputs = []
     for t in range(T):
