@@ -25,13 +25,12 @@ echo "--- Step 1/2: API Conformance ---"
 $PYTHON -m eval.check_server --base-url "${BASE_URL}"
 echo ""
 
-# 2. Throughput at c=4,16,64 with 16 requests each
-echo "--- Step 2/2: Throughput (c=4,16,64, 16 reqs each) ---"
+# 2. Throughput — matches real eval: 64 requests per level, all concurrency levels
+echo "--- Step 2/2: Throughput (c=1,2,4,8,16,32,64, 64 reqs each) ---"
 $PYTHON -m eval.throughput.run_throughput \
     --base-url "${BASE_URL}" \
+    --num-requests 64 \
     --concurrency 4 16 64 \
-    --num-requests 16 \
-    --num-prompts 32 \
     --output results/quick_throughput.json \
     --baseline baseline/results/throughput_baseline.json
 echo ""

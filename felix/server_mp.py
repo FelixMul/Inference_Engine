@@ -97,7 +97,7 @@ futures_lock = threading.Lock()
 request_counter = 0
 counter_lock = asyncio.Lock()
 num_gpus = 8
-batch_queues: list[asyncio.Queue] = []
+global_queue: asyncio.Queue = None  # single queue for all incoming requests
 
 
 @app.get("/health")
@@ -127,17 +127,14 @@ async def chat_completions(req: ChatCompletionRequest):
         prompt_len = input_ids.shape[1]
     prof.tokenize = t_tok.elapsed
 
-    # Round-robin GPU
+    # Assign request ID and submit to global queue
     async with counter_lock:
-        gpu_id = request_counter % num_gpus
         req_id = request_counter
         request_counter += 1
-    prof.gpu_id = gpu_id
 
-    # Create future and submit to batch queue
     future = loop.create_future()
     pending = PendingRequest(input_ids, req.max_tokens, req.temperature, req.top_p, prompt_len, future, req_id)
-    await batch_queues[gpu_id].put(pending)
+    await global_queue.put(pending)
 
     # Wait for result
     result_data = await future
@@ -179,51 +176,79 @@ def _tokenize(messages):
 
 
 # ---------------------------------------------------------------------------
-# Batch collectors + result dispatcher
+# Global dispatcher + result dispatcher
 # ---------------------------------------------------------------------------
 
-async def batch_collector(gpu_id: int, max_batch_size: int, batch_timeout: float):
-    """Collect requests for a GPU and send as batches to the worker process."""
-    queue = batch_queues[gpu_id]
+# Track which GPUs are busy
+gpu_busy: list[bool] = []
+
+def _dispatch_to_gpu(gpu_id: int, batch: list[PendingRequest], loop: asyncio.AbstractEventLoop):
+    """Send a batch of requests to a specific GPU worker."""
+    batch_req = BatchWorkRequest(
+        request_ids=[r.request_id for r in batch],
+        input_ids_bytes_list=[r.input_ids.numpy().tobytes() for r in batch],
+        input_shapes=[tuple(r.input_ids.shape) for r in batch],
+        max_tokens_list=[r.max_tokens for r in batch],
+        temperature_list=[r.temperature for r in batch],
+        top_p_list=[r.top_p for r in batch],
+    )
+    with futures_lock:
+        for r in batch:
+            pending_futures[r.request_id] = (r.future, loop)
+    gpu_busy[gpu_id] = True
+    request_queues[gpu_id].put(batch_req)
+
+
+async def global_dispatcher():
+    """Collect all incoming requests, distribute evenly across GPUs."""
     loop = asyncio.get_event_loop()
 
     while True:
-        batch: list[PendingRequest] = []
-        first = await queue.get()
-        batch.append(first)
+        # Wait for at least one request
+        first = await global_queue.get()
+        all_requests = [first]
 
-        deadline = time.monotonic() + batch_timeout
-        while len(batch) < max_batch_size:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
+        # Wait for concurrent requests to finish tokenizing and get queued.
+        # Tokenization takes ~15ms per request in thread pool, so 20ms
+        # captures most/all of a burst while adding minimal latency.
+        await asyncio.sleep(0.02)
+
+        # Drain everything available
+        while not global_queue.empty():
             try:
-                req = await asyncio.wait_for(queue.get(), timeout=remaining)
-                batch.append(req)
-            except asyncio.TimeoutError:
+                all_requests.append(global_queue.get_nowait())
+            except asyncio.QueueEmpty:
                 break
 
-        # Build batch request
-        batch_req = BatchWorkRequest(
-            request_ids=[r.request_id for r in batch],
-            input_ids_bytes_list=[r.input_ids.numpy().tobytes() for r in batch],
-            input_shapes=[tuple(r.input_ids.shape) for r in batch],
-            max_tokens_list=[r.max_tokens for r in batch],
-            temperature_list=[r.temperature for r in batch],
-            top_p_list=[r.top_p for r in batch],
-        )
+        # Find free GPUs
+        free_gpus = [i for i in range(num_gpus) if not gpu_busy[i]]
+        if not free_gpus:
+            # All GPUs busy — use all of them (requests will queue in worker)
+            free_gpus = list(range(num_gpus))
 
-        # Register futures
-        with futures_lock:
-            for r in batch:
-                pending_futures[r.request_id] = (r.future, loop)
+        # Distribute requests evenly across free GPUs
+        n_gpus = min(len(free_gpus), len(all_requests))
+        gpus_to_use = free_gpus[:n_gpus]
 
-        # Send to worker
-        request_queues[gpu_id].put(batch_req)
+        # Split requests into chunks, one per GPU
+        chunks = [[] for _ in range(n_gpus)]
+        for i, req in enumerate(all_requests):
+            chunks[i % n_gpus].append(req)
+
+        dispatch_parts = []
+        for gpu_id, chunk in zip(gpus_to_use, chunks):
+            if chunk:
+                dispatch_parts.append(f"GPU{gpu_id}={len(chunk)}")
+                _dispatch_to_gpu(gpu_id, chunk, loop)
+
+        print(f"[dispatcher] {len(all_requests)} requests -> {', '.join(dispatch_parts)}", flush=True)
 
 
 def result_dispatcher():
     """Background thread that reads results from workers and resolves futures."""
+    # Track how many pending results per GPU to know when a GPU is free
+    gpu_pending = [0] * num_gpus
+
     while True:
         try:
             item = result_queue.get()
@@ -235,16 +260,24 @@ def result_dispatcher():
                 if entry:
                     future, loop = entry
                     loop.call_soon_threadsafe(future.set_result, item)
+
+                    # Check if this GPU's batch is complete
+                    # Find which GPU this request was on by checking all queues
+                    # Simple approach: mark all GPUs as free when any result comes back
+                    # The dispatcher will re-check on next dispatch
+                    for i in range(num_gpus):
+                        gpu_busy[i] = False
         except Exception as e:
             print(f"[result_dispatcher] Error: {e}")
 
 
 @app.on_event("startup")
 async def startup():
+    global global_queue
+    global_queue = asyncio.Queue()
     loop = asyncio.get_event_loop()
-    for i in range(num_gpus):
-        loop.create_task(batch_collector(i, max_batch_size=8, batch_timeout=0.05))
-    print(f"Started {num_gpus} batch collectors")
+    loop.create_task(global_dispatcher())
+    print(f"Started global dispatcher for {num_gpus} GPUs")
 
 
 # ---------------------------------------------------------------------------
@@ -252,7 +285,7 @@ async def startup():
 # ---------------------------------------------------------------------------
 
 def main():
-    global tokenizer, profiler, request_queues, result_queue, num_gpus, batch_queues
+    global tokenizer, profiler, request_queues, result_queue, num_gpus, gpu_busy
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8003)
@@ -292,8 +325,8 @@ def main():
 
     print(f"All {num_gpus} workers ready!")
 
-    # Initialize batch queues
-    batch_queues = [asyncio.Queue() for _ in range(num_gpus)]
+    # Initialize GPU busy tracking
+    gpu_busy = [False] * num_gpus
 
     # Start result dispatcher thread
     dispatcher = threading.Thread(target=result_dispatcher, daemon=True)
