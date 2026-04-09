@@ -80,7 +80,7 @@ class FullAttention(nn.Module):
             causal = causal.triu(T_total - T + 1)
             attn = attn + causal.unsqueeze(0).unsqueeze(0)
 
-        attn = F.softmax(attn, dim=-1)
+        attn = F.softmax(attn.float(), dim=-1).to(x.dtype)
         out = torch.matmul(attn, v)  # [B, Q_H, T, D]
 
         # reshape back
