@@ -7,12 +7,33 @@ Each replica handles requests independently with:
 - Batched generation within each GPU
 """
 
+import threading
 import time
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+
+# Patch Triton's autotuner to be thread-safe.
+# The bug: Autotuner.run() sets self.nargs then calls _bench() which reads it.
+# Two threads calling run() simultaneously corrupt each other's nargs.
+_triton_lock = threading.Lock()
+
+def _patch_triton_autotuner():
+    """Wrap Triton's Autotuner.run with a lock to make it thread-safe."""
+    try:
+        from triton.runtime.autotuner import Autotuner
+        original_run = Autotuner.run
+        def thread_safe_run(self, *args, **kwargs):
+            with _triton_lock:
+                return original_run(self, *args, **kwargs)
+        Autotuner.run = thread_safe_run
+        print("[engine] Patched Triton autotuner for thread safety")
+    except Exception as e:
+        print(f"[engine] Warning: could not patch Triton autotuner: {e}")
+
+_patch_triton_autotuner()
 
 
 @dataclass
@@ -84,6 +105,17 @@ class InferenceEngine:
 
         print(f"All replicas loaded in {time.time() - t0:.1f}s")
         self._print_memory()
+        self._warmup()
+
+    def _warmup(self):
+        """Run one request per GPU to warm up Triton kernel caches."""
+        print("Warming up GPUs...")
+        dummy_ids = self.tokenizer("Hello", return_tensors="pt").input_ids
+        for i in range(self.num_gpus):
+            print(f"  GPU {i}...", end=" ", flush=True)
+            self._generate_impl(i, dummy_ids, max_new_tokens=4)
+            print("ok")
+        print("Warmup complete.")
 
     def _print_memory(self):
         """Print per-GPU memory usage."""
@@ -101,7 +133,17 @@ class InferenceEngine:
         temperature: float = 0.0,
         top_p: float = 1.0,
     ) -> GenerationResult:
-        """Manual decode loop on a specific GPU. Much less overhead than HF generate()."""
+        """Manual decode loop on a specific GPU."""
+        return self._generate_impl(gpu_id, input_ids, max_new_tokens, temperature, top_p)
+
+    def _generate_impl(
+        self,
+        gpu_id: int,
+        input_ids: torch.Tensor,
+        max_new_tokens: int = 1024,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+    ) -> GenerationResult:
         model = self.models[gpu_id]
         device = f"cuda:{gpu_id}"
         ids = input_ids.to(device)
@@ -151,8 +193,21 @@ class InferenceEngine:
         top_p_list: list[float],
     ) -> list[GenerationResult]:
         """Batched generation on a single GPU. Amortizes weight reads across requests."""
+        return self._generate_batch_impl(
+            gpu_id, input_ids_list, max_new_tokens_list,
+            temperature_list, top_p_list,
+        )
+
+    def _generate_batch_impl(
+        self,
+        gpu_id: int,
+        input_ids_list: list[torch.Tensor],
+        max_new_tokens_list: list[int],
+        temperature_list: list[float],
+        top_p_list: list[float],
+    ) -> list[GenerationResult]:
         if len(input_ids_list) == 1:
-            return [self.generate(
+            return [self._generate_impl(
                 gpu_id, input_ids_list[0], max_new_tokens_list[0],
                 temperature_list[0], top_p_list[0],
             )]
