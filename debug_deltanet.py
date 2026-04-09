@@ -92,7 +92,7 @@ torch.cuda.empty_cache()
 print("Loading our model...")
 from server.model.loader import load_model
 from server.model.rope import build_rope_freqs
-import torch.nn.functional as F as F2
+import torch.nn.functional as F
 
 our = load_model(MODEL_PATH, device="cuda")
 our.eval()
