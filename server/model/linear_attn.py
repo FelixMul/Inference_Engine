@@ -107,21 +107,20 @@ class GatedDeltaNet(nn.Module):
             b_t  = beta[:, t]   # [B, 32]
             d_t  = decay[:, t]  # [B, 32]
 
-            # Current state readout: S k_t → [B, 32, 128]
-            Sk = torch.einsum("bhi,bhij->bhj", k_t, state)
+            # 1. Decay state first
+            state = state * d_t.unsqueeze(-1).unsqueeze(-1)
 
-            # Delta: what we want to store minus what's already there
-            delta = v_t - Sk   # [B, 32, 128]
+            # 2. Compute delta based on the ALREADY-DECAYED state
+            Sk = torch.einsum("bhi,bhij->bhj", k_t, state)  # [B, 32, 128]
+            delta = v_t - Sk
 
-            # Outer product: k_t ⊗ (beta * delta) → [B, 32, 128, 128]
+            # 3. Outer product update: k_t ⊗ (beta * delta) → [B, 32, 128, 128]
             update = torch.einsum(
                 "bhi,bhj->bhij",
                 k_t,
                 b_t.unsqueeze(-1) * delta,
             )
-
-            # Apply decay and add update
-            state = state * d_t.unsqueeze(-1).unsqueeze(-1) + update
+            state = state + update
 
             # Read output: S q_t → [B, 32, 128]
             o_t = torch.einsum("bhi,bhij->bhj", q_t, state)
