@@ -19,6 +19,17 @@ from .config import (
 )
 from .norm import RMSNormGated
 
+# Optional fast path: flash-linear-attention. The hackathon rules explicitly
+# allow low-level libraries (cuBLAS, cuDNN, NCCL, Triton, etc.), and FLA is a
+# Triton kernel package — not a high-level inference framework. We use it for
+# the prefill recurrence; the per-token decode path stays in our own loop.
+try:
+    from fla.ops.gated_delta_rule import chunk_gated_delta_rule as _fla_chunk
+    _HAS_FLA = True
+except ImportError:
+    _fla_chunk = None
+    _HAS_FLA = False
+
 _K_DIM = LINEAR_NUM_KEY_HEADS * LINEAR_KEY_HEAD_DIM    # 16*128 = 2048
 _V_DIM = LINEAR_NUM_VALUE_HEADS * LINEAR_VALUE_HEAD_DIM  # 32*128 = 4096
 _CONV_DIM = _K_DIM * 2 + _V_DIM                        # 8192  (Q+K+V)
@@ -83,54 +94,61 @@ class GatedDeltaNet(nn.Module):
         q = q.repeat_interleave(_EXPAND, dim=2)   # [B, T, 32, 128]
         kk = kk.repeat_interleave(_EXPAND, dim=2)  # [B, T, 32, 128]
 
-        # L2-normalize Q and K (use_qk_l2norm_in_kernel=True), then scale Q by 1/sqrt(d_k).
-        # HF's torch_recurrent_gated_delta_rule does `query = query * (1 / sqrt(k_head_dim))`
-        # before the recurrence; without it our output norm is sqrt(128)x too large.
-        q = F.normalize(q.float(), dim=-1).to(x.dtype)
-        kk = F.normalize(kk.float(), dim=-1).to(x.dtype)
-        q = q * (_HEAD_DIM ** -0.5)
-
-        # Beta and decay (computed in float32 for precision)
+        # Beta and log-decay (computed in float32 for precision).
+        # NOTE: FLA's kernel wants the LOG decay g (negative); the sequential
+        # fallback below wants the actual decay = g.exp().
         beta = torch.sigmoid(b_raw.float()).to(x.dtype)   # [B, T, 32]
-        # g = -exp(A_log) * softplus(a + dt_bias)  [log-space decay, negative]
         g = (-self.A_log.float().exp() *
              F.softplus(a_raw.float() + self.dt_bias.float()))  # [B, T, 32]
-        decay = g.exp().to(x.dtype)   # actual decay in [0, 1]
 
-        # Initialize recurrent state: [B, 32, 128, 128]
-        if state is None:
-            state = x.new_zeros(B, _EXP_HEADS, _HEAD_DIM, _HEAD_DIM)
-
-        # Sequential delta-rule update
-        outputs = []
-        for t in range(T):
-            q_t  = q[:, t]      # [B, 32, 128]
-            k_t  = kk[:, t]     # [B, 32, 128]
-            v_t  = v[:, t]      # [B, 32, 128]
-            b_t  = beta[:, t]   # [B, 32]
-            d_t  = decay[:, t]  # [B, 32]
-
-            # 1. Decay state first
-            state = state * d_t.unsqueeze(-1).unsqueeze(-1)
-
-            # 2. Compute delta based on the ALREADY-DECAYED state
-            Sk = torch.einsum("bhi,bhij->bhj", k_t, state)  # [B, 32, 128]
-            delta = v_t - Sk
-
-            # 3. Outer product update: k_t ⊗ (beta * delta) → [B, 32, 128, 128]
-            update = torch.einsum(
-                "bhi,bhj->bhij",
-                k_t,
-                b_t.unsqueeze(-1) * delta,
+        # ── Fast path: chunked Triton kernel (FLA) ────────────────────────────
+        # Use the kernel whenever the sequence has more than one token (prefill,
+        # or any continuation with T>1). The kernel pads to chunk_size=64 so
+        # T==1 is wasted on it; we keep the sequential loop for the decode step.
+        if _HAS_FLA and T > 1:
+            # Kernel performs L2-norm and 1/sqrt(d_k) query scaling internally
+            # when use_qk_l2norm_in_kernel=True — pass q and kk RAW.
+            core_out, last_state = _fla_chunk(
+                q, kk, v, g=g, beta=beta,
+                initial_state=state,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
             )
-            state = state + update
+            out = core_out                      # [B, T, 32, 128]
+            state = last_state                  # [B, 32, 128, 128]
+        else:
+            # ── Slow path: pure-PyTorch sequential recurrence ────────────────
+            # Used for the per-token decode step (T==1) and as a fallback when
+            # FLA isn't installed. Same math the kernel computes.
+            q_n  = F.normalize(q.float(), dim=-1).to(x.dtype)
+            kk_n = F.normalize(kk.float(), dim=-1).to(x.dtype)
+            q_n  = q_n * (_HEAD_DIM ** -0.5)
+            decay = g.exp().to(x.dtype)
 
-            # Read output: S q_t → [B, 32, 128]
-            o_t = torch.einsum("bhi,bhij->bhj", q_t, state)
-            outputs.append(o_t)
+            if state is None:
+                state = x.new_zeros(B, _EXP_HEADS, _HEAD_DIM, _HEAD_DIM)
 
-        # [B, T, 32, 128]
-        out = torch.stack(outputs, dim=1)
+            outputs = []
+            for t in range(T):
+                q_t  = q_n[:, t]
+                k_t  = kk_n[:, t]
+                v_t  = v[:, t]
+                b_t  = beta[:, t]
+                d_t  = decay[:, t]
+
+                state = state * d_t.unsqueeze(-1).unsqueeze(-1)
+                Sk = torch.einsum("bhi,bhij->bhj", k_t, state)
+                delta = v_t - Sk
+                update = torch.einsum(
+                    "bhi,bhj->bhij",
+                    k_t,
+                    b_t.unsqueeze(-1) * delta,
+                )
+                state = state + update
+                o_t = torch.einsum("bhi,bhij->bhj", q_t, state)
+                outputs.append(o_t)
+
+            out = torch.stack(outputs, dim=1)
 
         # RMSNormGated: norm(out) * weight * silu(z)
         # Flatten to [B*T*32, 128] for norm, z same shape

@@ -8,7 +8,8 @@ from .model import Qwen35MoE
 from .config import FULL_ATTN_LAYERS, NUM_LAYERS
 
 
-def load_model(model_path: str, device: str = "cuda") -> Qwen35MoE:
+def _build_remapped_state_dict(model_path: str) -> dict:
+    """Load HF checkpoint once and return a state dict keyed for our model."""
     print("Loading weights from HuggingFace checkpoint...")
     hf_model = AutoModelForCausalLM.from_pretrained(
         model_path,
@@ -18,10 +19,7 @@ def load_model(model_path: str, device: str = "cuda") -> Qwen35MoE:
     hf_sd = hf_model.state_dict()
     del hf_model  # free memory immediately
 
-    model = Qwen35MoE()
-
-    sd = model.state_dict()
-    new_sd = {}
+    new_sd: dict = {}
 
     def cp(our_key: str, hf_key: str):
         if hf_key not in hf_sd:
@@ -70,15 +68,39 @@ def load_model(model_path: str, device: str = "cuda") -> Qwen35MoE:
         cp(f"{p}.mlp.shared_down.weight",      f"{hfp}.mlp.shared_expert.down_proj.weight")
         cp(f"{p}.mlp.shared_expert_gate.weight", f"{hfp}.mlp.shared_expert_gate.weight")
 
-    # Load into model
+    return new_sd
+
+
+def load_model(model_path: str, device: str = "cuda") -> Qwen35MoE:
+    """Load a single model replica onto `device`. Kept for back-compat."""
+    new_sd = _build_remapped_state_dict(model_path)
+    return _instantiate_replica(new_sd, device)
+
+
+def load_replicas(model_path: str, devices: list[str]) -> list[Qwen35MoE]:
+    """Load N model replicas, one per device.
+
+    Loads the HF checkpoint and remaps state-dict keys ONCE, then instantiates
+    a fresh Qwen35MoE on each device and loads the (CPU) state dict into it.
+    Avoids paying the 30s+ HF cold-load cost N times.
+    """
+    new_sd = _build_remapped_state_dict(model_path)
+    replicas: list[Qwen35MoE] = []
+    for i, device in enumerate(devices):
+        print(f"Instantiating replica {i+1}/{len(devices)} on {device}...")
+        replica = _instantiate_replica(new_sd, device)
+        replicas.append(replica)
+    print(f"All {len(devices)} replicas ready.")
+    return replicas
+
+
+def _instantiate_replica(new_sd: dict, device: str) -> Qwen35MoE:
+    model = Qwen35MoE()
     missing, unexpected = model.load_state_dict(new_sd, strict=False)
     if missing:
-        print(f"Missing keys: {missing}")
+        print(f"  Missing keys: {missing}")
     if unexpected:
-        print(f"Unexpected keys: {unexpected}")
-
-    print(f"Moving model to {device}...")
+        print(f"  Unexpected keys: {unexpected}")
     model = model.to(device=device, dtype=torch.bfloat16)
     model.eval()
-    print("Model ready.")
     return model
