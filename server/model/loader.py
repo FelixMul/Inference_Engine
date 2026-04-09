@@ -55,7 +55,7 @@ def load_model(model_path: str, device: str = "cuda") -> Qwen35MoE:
             cp(f"{p}.attn.in_proj_z.weight",   f"{hfp}.linear_attn.in_proj_z.weight")
             cp(f"{p}.attn.in_proj_b.weight",   f"{hfp}.linear_attn.in_proj_b.weight")
             cp(f"{p}.attn.in_proj_a.weight",   f"{hfp}.linear_attn.in_proj_a.weight")
-            cp(f"{p}.attn.conv1d.weight",      f"{hfp}.linear_attn.conv1d.weight")
+            cp(f"{p}.attn.conv1d_weight",      f"{hfp}.linear_attn.conv1d.weight")
             cp(f"{p}.attn.dt_bias",            f"{hfp}.linear_attn.dt_bias")
             cp(f"{p}.attn.A_log",              f"{hfp}.linear_attn.A_log")
             cp(f"{p}.attn.norm.weight",        f"{hfp}.linear_attn.norm.weight")
