@@ -18,6 +18,7 @@ from .config import (
     HIDDEN_SIZE, NUM_Q_HEADS, NUM_KV_HEADS, HEAD_DIM, ROTARY_DIMS,
 )
 from .rope import apply_rope
+from .norm import RMSNorm
 
 
 class FullAttention(nn.Module):
@@ -27,8 +28,8 @@ class FullAttention(nn.Module):
         self.k_proj = nn.Linear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, bias=False)
         self.v_proj = nn.Linear(HIDDEN_SIZE, NUM_KV_HEADS * HEAD_DIM, bias=False)
         self.o_proj = nn.Linear(NUM_Q_HEADS * HEAD_DIM, HIDDEN_SIZE, bias=False)
-        self.q_norm = nn.LayerNorm(HEAD_DIM, elementwise_affine=True, eps=1e-6)
-        self.k_norm = nn.LayerNorm(HEAD_DIM, elementwise_affine=True, eps=1e-6)
+        self.q_norm = RMSNorm(HEAD_DIM)
+        self.k_norm = RMSNorm(HEAD_DIM)
 
     def forward(
         self,
