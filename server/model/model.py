@@ -134,7 +134,7 @@ class Qwen35MoE(nn.Module):
             if next_token.item() == eos_token_id:
                 break
 
-        return torch.cat(generated, dim=-1)  # [1, num_generated]
+        return torch.stack(generated, dim=1)  # [1, num_generated]
 
     def _sample(self, logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
         if temperature == 0.0:
