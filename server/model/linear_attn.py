@@ -114,8 +114,11 @@ class GatedDeltaNet(nn.Module):
                 output_final_state=True,
                 use_qk_l2norm_in_kernel=True,
             )
-            out = core_out                      # [B, T, 32, 128]
-            state = last_state                  # [B, 32, 128, 128]
+            # Kernel computes in fp32 internally; cast state back so the
+            # decode-step sequential path (which runs in bf16) doesn't see
+            # a dtype mismatch.
+            out = core_out.to(x.dtype)          # [B, T, 32, 128]
+            state = last_state.to(x.dtype)      # [B, 32, 128, 128]
         else:
             # ── Slow path: pure-PyTorch sequential recurrence ────────────────
             # Used for the per-token decode step (T==1) and as a fallback when
