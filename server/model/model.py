@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .config import (
-    HIDDEN_SIZE, NUM_LAYERS, VOCAB_SIZE, EOS_TOKEN_ID, FULL_ATTN_LAYERS,
+    HIDDEN_SIZE, NUM_LAYERS, VOCAB_SIZE, EOS_TOKEN_IDS, FULL_ATTN_LAYERS,
 )
 from .norm import RMSNorm
 from .rope import build_rope_freqs
@@ -101,7 +101,7 @@ class Qwen35MoE(nn.Module):
         max_new_tokens: int,
         temperature: float = 0.0,
         top_p: float = 1.0,
-        eos_token_id: int = EOS_TOKEN_ID,
+        eos_token_ids: frozenset = EOS_TOKEN_IDS,
     ) -> torch.Tensor:
         device = input_ids.device
         inv_freq = build_rope_freqs(input_ids.shape[1] + max_new_tokens, device)
@@ -131,7 +131,7 @@ class Qwen35MoE(nn.Module):
             )
             next_token = self._sample(logits[:, -1, :], temperature, top_p)
             generated.append(next_token)
-            if next_token.item() == eos_token_id:
+            if next_token.item() in eos_token_ids:
                 break
 
         return torch.stack(generated, dim=1)  # [1, num_generated]

@@ -28,5 +28,8 @@ NUM_EXPERTS_PER_TOK = 8
 MOE_INTERMEDIATE_SIZE = 512
 SHARED_EXPERT_INTERMEDIATE_SIZE = 512
 
-# Special tokens
-EOS_TOKEN_ID = 248044
+# Special tokens.
+# Qwen has two stop tokens for chat: <|endoftext|>=248044 and <|im_end|>=248046.
+# In chat mode the model ends its turn with <|im_end|>, so we must stop on either.
+EOS_TOKEN_IDS = frozenset({248044, 248046})
+EOS_TOKEN_ID = 248044  # kept for back-compat with anything still importing this
