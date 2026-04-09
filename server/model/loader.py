@@ -2,6 +2,9 @@
 Load weights from HuggingFace checkpoint into our custom model.
 Transformers is used ONLY here for weight loading.
 """
+import time
+from concurrent.futures import ThreadPoolExecutor
+
 import torch
 from transformers import AutoModelForCausalLM
 from .model import Qwen35MoE
@@ -78,29 +81,40 @@ def load_model(model_path: str, device: str = "cuda") -> Qwen35MoE:
 
 
 def load_replicas(model_path: str, devices: list[str]) -> list[Qwen35MoE]:
-    """Load N model replicas, one per device.
+    """Load N model replicas, one per device, in parallel.
 
-    Loads the HF checkpoint and remaps state-dict keys ONCE, then instantiates
-    a fresh Qwen35MoE on each device and loads the (CPU) state dict into it.
-    Avoids paying the 30s+ HF cold-load cost N times.
+    Loads the HF checkpoint and remaps state-dict keys ONCE on CPU, then
+    instantiates one Qwen35MoE per device concurrently. H2D copies to
+    different GPUs use independent PCIe lanes and torch releases the GIL
+    during the copy, so threading gives near-linear speedup over the
+    sequential version.
     """
     new_sd = _build_remapped_state_dict(model_path)
-    replicas: list[Qwen35MoE] = []
-    for i, device in enumerate(devices):
-        print(f"Instantiating replica {i+1}/{len(devices)} on {device}...")
-        replica = _instantiate_replica(new_sd, device)
-        replicas.append(replica)
-    print(f"All {len(devices)} replicas ready.")
-    return replicas
+    n = len(devices)
+    print(f"Instantiating {n} replicas in parallel on {devices}...")
+    t0 = time.time()
+    replicas: list[Qwen35MoE | None] = [None] * n
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        futures = {
+            pool.submit(_instantiate_replica, new_sd, device, i): i
+            for i, device in enumerate(devices)
+        }
+        for fut in futures:
+            i = futures[fut]
+            replicas[i] = fut.result()
+    print(f"All {n} replicas ready in {time.time() - t0:.1f}s.")
+    return replicas  # type: ignore[return-value]
 
 
-def _instantiate_replica(new_sd: dict, device: str) -> Qwen35MoE:
+def _instantiate_replica(new_sd: dict, device: str, idx: int) -> Qwen35MoE:
+    t0 = time.time()
     model = Qwen35MoE()
     missing, unexpected = model.load_state_dict(new_sd, strict=False)
     if missing:
-        print(f"  Missing keys: {missing}")
+        print(f"  [{device}] missing keys: {missing}")
     if unexpected:
-        print(f"  Unexpected keys: {unexpected}")
+        print(f"  [{device}] unexpected keys: {unexpected}")
     model = model.to(device=device, dtype=torch.bfloat16)
     model.eval()
+    print(f"  [{device}] ready in {time.time() - t0:.1f}s")
     return model
