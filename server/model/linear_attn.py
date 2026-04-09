@@ -128,12 +128,12 @@ class GatedDeltaNet(nn.Module):
             # delta rule: new_v = v_t - Sk_t (what we want to store)
             delta_v = v_t_r - Sk_t_r  # [B, 16, 2, 128]
 
-            # outer product update: k_t ⊗ (b * delta_v) -> [B, 16, 128, 256]
+            # outer product update: k_t ⊗ (b * delta_v) -> [B, 16, 128, 2, 128] -> [B, 16, 128, 256]
             update = torch.einsum(
-                "bhi,bhpj->bhij",
+                "bhi,bhpj->bhipj",
                 k_t,
                 b_t_r.unsqueeze(-1) * delta_v,
-            )  # [B, 16, 128, 256]
+            ).reshape(B, LINEAR_NUM_KEY_HEADS, LINEAR_KEY_HEAD_DIM, _STATE_VAL_DIM)
 
             # apply decay per value-head then add update
             d_t_full = d_t_r.unsqueeze(2).expand(-1, -1, LINEAR_KEY_HEAD_DIM, -1)  # [B,16,128,2]
