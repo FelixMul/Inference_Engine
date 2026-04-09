@@ -151,7 +151,7 @@ with torch.no_grad():
     diff("g (log decay)", hf_vals['g'].to(h.dtype), g_our.to(h.dtype))
     diff("z", hf_vals['z'], z)
 
-    # Sequential delta rule
+    # Sequential delta rule (decay first, then delta from decayed state)
     q_n  = F.normalize(q.float(), dim=-1).to(h.dtype)
     kk_n = F.normalize(kk.float(), dim=-1).to(h.dtype)
     state = h.new_zeros(B, _EXP_HEADS, _HEAD_DIM, _HEAD_DIM)
@@ -159,10 +159,11 @@ with torch.no_grad():
     for t in range(T):
         q_t = q_n[:, t]; k_t = kk_n[:, t]; v_t = v[:, t]
         b_t = beta[:, t]; d_t = decay[:, t]
-        Sk = torch.einsum("bhi,bhij->bhj", k_t, state)
+        state = state * d_t.unsqueeze(-1).unsqueeze(-1)   # decay first
+        Sk = torch.einsum("bhi,bhij->bhj", k_t, state)    # delta from decayed state
         delta = v_t - Sk
         update = torch.einsum("bhi,bhj->bhij", k_t, b_t.unsqueeze(-1) * delta)
-        state = state * d_t.unsqueeze(-1).unsqueeze(-1) + update
+        state = state + update
         outputs.append(torch.einsum("bhi,bhij->bhj", q_t, state))
 
     core_out = torch.stack(outputs, dim=1)  # [B, T, 32, 128]
