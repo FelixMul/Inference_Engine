@@ -77,11 +77,11 @@ class GatedDeltaNet(nn.Module):
             pad = qkv_t.new_zeros(B, _QKV_DIM, k - 1)
             qkv_padded = torch.cat([pad, qkv_t], dim=2)       # [B, 8192, k-1+T]
 
-        # Save last k-1 tokens as buffer for next call
-        new_conv_buf = qkv_t[..., -(k - 1):].clone()
-
         # Depthwise conv with no padding (already padded above)
         qkv_conv = F.conv1d(qkv_padded, self.conv1d_weight, groups=_QKV_DIM)  # [B, 8192, T]
+
+        # Save last k-1 tokens from padded input as buffer for next call
+        new_conv_buf = qkv_padded[..., -(k - 1):].clone()
         qkv = qkv_conv.transpose(1, 2)  # [B, T, 8192]
 
         # Split Q, K, V and normalize
