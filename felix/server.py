@@ -174,10 +174,11 @@ async def chat_completions(req: ChatCompletionRequest):
     prof = profiler.new_request()
     t_start = time.perf_counter()
 
-    # Tokenize
+    # Tokenize (offloaded to thread pool to not block event loop)
     with Timer() as t_tok:
         messages = [{"role": m.role, "content": m.content} for m in req.messages]
-        input_ids = engine.tokenize_chat(messages)
+        loop = asyncio.get_event_loop()
+        input_ids = await loop.run_in_executor(None, engine.tokenize_chat, messages)
         prompt_len = input_ids.shape[1]
     prof.tokenize = t_tok.elapsed
 

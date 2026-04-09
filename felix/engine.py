@@ -252,36 +252,36 @@ class InferenceEngine:
         past_key_values = outputs.past_key_values
         next_token_logits = outputs.logits[:, -1, :]
 
+        # Precompute tensors for vectorized sampling
+        temperatures = torch.tensor(temperature_list, device=device).unsqueeze(1)
+        finished_t = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        remaining_t = torch.tensor(max_new_tokens_list, dtype=torch.long, device=device)
+        eos_ids = torch.tensor(list(self.eos_token_ids), dtype=torch.long, device=device)
+        pad_token = torch.tensor(pad_id, dtype=torch.long, device=device)
+        all_generated = torch.zeros(batch_size, max_new, dtype=torch.long, device=device)
+        gen_lengths = torch.zeros(batch_size, dtype=torch.long, device=device)
+
         for step in range(max_new):
-            if all(finished):
+            if finished_t.all():
                 break
 
-            # Sample for each request in batch
-            next_tokens = []
-            for i in range(batch_size):
-                if finished[i]:
-                    # Use pad token for finished sequences
-                    next_tokens.append(torch.tensor([pad_id], device=device))
-                else:
-                    tok = self._sample(
-                        next_token_logits[i:i+1],
-                        temperature_list[i],
-                        top_p_list[i],
-                    )
-                    generated[i].append(tok)
-                    remaining_tokens[i] -= 1
+            # Vectorized sampling across full batch
+            next_tokens = self._sample_batch(next_token_logits, temperatures, finished_t, pad_token)
 
-                    if tok.item() in self.eos_token_ids or remaining_tokens[i] <= 0:
-                        finished[i] = True
-                    next_tokens.append(tok)
+            # Store tokens and update state
+            all_generated[:, step] = next_tokens
+            gen_lengths += (~finished_t).long()
 
-            if all(finished):
+            # Check EOS and remaining tokens
+            remaining_t -= (~finished_t).long()
+            hit_eos_mask = (next_tokens.unsqueeze(1) == eos_ids.unsqueeze(0)).any(dim=1)
+            finished_t |= hit_eos_mask | (remaining_t <= 0)
+
+            if finished_t.all():
                 break
 
-            next_input = torch.cat(next_tokens, dim=0).unsqueeze(1).to(device)
-            # Extend attention mask
-            batch_mask = torch.cat([batch_mask, torch.ones(batch_size, 1, device=device, dtype=torch.long)], dim=1)
-            # Mark finished sequences' new positions as attended (model expects it)
+            next_input = next_tokens.unsqueeze(1)
+            batch_mask = torch.cat([batch_mask, (~finished_t).long().unsqueeze(1)], dim=1)
 
             outputs = model(
                 input_ids=next_input,
@@ -295,29 +295,47 @@ class InferenceEngine:
         # Build results
         results = []
         for i in range(batch_size):
-            if generated[i]:
-                token_ids = torch.cat(generated[i], dim=0).cpu()
+            length = gen_lengths[i].item()
+            if length > 0:
+                token_ids = all_generated[i, :length].cpu()
+                hit_eos = token_ids[-1].item() in self.eos_token_ids
             else:
                 token_ids = torch.tensor([], dtype=torch.long)
-            hit_eos = len(generated[i]) > 0 and generated[i][-1].item() in self.eos_token_ids
+                hit_eos = False
             results.append(GenerationResult(token_ids=token_ids, hit_eos=hit_eos))
 
         return results
 
+    def _sample_batch(self, logits: torch.Tensor, temperatures: torch.Tensor,
+                       finished: torch.Tensor, pad_token: torch.Tensor) -> torch.Tensor:
+        """Vectorized sampling across the full batch. Single kernel call."""
+        # For finished sequences, return pad token
+        # For greedy (temp=0), use argmax
+        # For sampling, use multinomial
+        greedy_mask = (temperatures.squeeze(1) <= 0) | finished
+        sample_mask = ~greedy_mask
+
+        result = torch.full((logits.shape[0],), pad_token.item(), dtype=torch.long, device=logits.device)
+
+        # Greedy tokens
+        if greedy_mask.any():
+            result[greedy_mask] = logits[greedy_mask].argmax(dim=-1)
+
+        # Sampled tokens
+        if sample_mask.any():
+            scaled = logits[sample_mask] / temperatures[sample_mask]
+            probs = F.softmax(scaled, dim=-1)
+            result[sample_mask] = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+        # Override finished sequences with pad
+        result[finished] = pad_token
+        return result
+
     def _sample(self, logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
-        """Sample a single token from logits."""
+        """Sample a single token from logits (used for non-batched generation)."""
         if temperature <= 0:
             return logits.argmax(dim=-1)
-
         logits = logits / temperature
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            # Remove tokens with cumulative probability above the threshold
-            sorted_indices_to_remove = cumulative_probs - F.softmax(sorted_logits, dim=-1) >= top_p
-            sorted_logits[sorted_indices_to_remove] = float('-inf')
-            logits = sorted_logits.scatter(1, sorted_indices, sorted_logits)
-
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
